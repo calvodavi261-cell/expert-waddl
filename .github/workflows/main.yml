@@ -1,0 +1,136 @@
+name: NuvemPC (GPU emulada - WARP)
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutos:
+        description: "Quantos minutos o PC fica ligado (1 anuncio = 20)"
+        default: "20"
+        required: true
+
+jobs:
+  pc:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    env:
+      MINUTOS: ${{ inputs.minutos }}
+    steps:
+      # ---------- ETAPA 1: GPU emulada ----------
+      - name: "1/4 Preparar GPU emulada (WARP)"
+        shell: pwsh
+        run: |
+          Write-Host "Placas de video vistas pelo Windows:"
+          Get-CimInstance Win32_VideoController | Select-Object Name, AdapterRAM, DriverVersion | Format-List
+          # O WARP (Microsoft Basic Render Driver) ja vem no Windows e e usado
+          # automaticamente quando nao ha GPU real. Aqui so garantimos que o
+          # Direct3D esta pronto e que nao ha limite de tempo de GPU (TDR).
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" /v TdrLevel /t REG_DWORD /d 0 /f
+          # Tela grande e 60 Hz para a sessao remota
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v fEnableWinStation /t REG_DWORD /d 1 /f
+          # Usar renderizacao grafica no RDP (acelera a imagem)
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v bEnumerateHWBeforeSW /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v fEnableVirtualizedGraphics /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxMonitors /t REG_DWORD /d 1 /f
+
+      # ---------- ETAPA 1b: Direct3D 11 pelo WARP ----------
+      - name: "1b/4 Testar Direct3D 11 (WARP)"
+        shell: pwsh
+        run: |
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public class D3DTest {
+            [DllImport("d3d11.dll")]
+            public static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software,
+              uint flags, IntPtr levels, uint nLevels, uint sdk, out IntPtr device, out int featureLevel, out IntPtr context);
+          }
+          '@
+          $dev = [IntPtr]::Zero; $ctx = [IntPtr]::Zero; $fl = 0
+          # driverType 5 = D3D_DRIVER_TYPE_WARP (GPU emulada por software)
+          $hr = [D3DTest]::D3D11CreateDevice([IntPtr]::Zero, 5, [IntPtr]::Zero, 0, [IntPtr]::Zero, 0, 7, [ref]$dev, [ref]$fl, [ref]$ctx)
+          if ($hr -eq 0) { Write-Host ("Direct3D 11 via WARP OK. Feature level: 0x{0:x}" -f $fl) }
+          else { Write-Host ("Falha ao criar dispositivo WARP. HRESULT: 0x{0:x}" -f $hr) }
+          dxdiag /t "$env:USERPROFILE\Desktop\dxdiag.txt"
+
+          # Script para o Roblox usar Direct3D 11 e mirar 60 FPS (rodar depois de instalar o Roblox)
+          New-Item -ItemType Directory -Force "$env:USERPROFILE\Desktop" | Out-Null
+          @'
+          $json = @{ FFlagDebugGraphicsPreferD3D11 = $true; DFIntTaskSchedulerTargetFps = 60 } | ConvertTo-Json
+          Get-ChildItem "$env:LOCALAPPDATA\Roblox\Versions" -Directory | ForEach-Object {
+            New-Item -ItemType Directory -Force "$($_.FullName)\ClientSettings" | Out-Null
+            Set-Content "$($_.FullName)\ClientSettings\ClientAppSettings.json" $json
+          }
+          Write-Host "Pronto. Abra o Roblox e deixe os graficos no minimo."
+          '@ | Set-Content "$env:USERPROFILE\Desktop\AplicarRoblox.ps1"
+
+      # ---------- ETAPA 2: Acesso remoto (RDP) ----------
+      - name: "2/4 Ligar acesso remoto e criar senha"
+        shell: pwsh
+        run: |
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+          $chars = (48..57) + (65..90) + (97..122)
+          $senha = -join (1..16 | ForEach-Object { [char]($chars | Get-Random) })
+          net user runneradmin "$senha" | Out-Null
+          "SENHA=$senha" | Out-File -FilePath senha.txt -Encoding ascii
+
+      # ---------- ETAPA 3: Tailscale (link de login) ----------
+      - name: "3/4 Tailscale - clique no link de login"
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile ts.msi
+          Start-Process msiexec.exe -ArgumentList "/i ts.msi /quiet /norestart" -Wait
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          Start-Sleep 5
+          # 'tailscale up' fica esperando o login e imprime o link
+          Start-Process $ts -ArgumentList "up --unattended --hostname=nuvempc --accept-dns=false" `
+            -RedirectStandardOutput up_out.txt -RedirectStandardError up_err.txt -NoNewWindow
+          $link = $null
+          for ($i = 0; $i -lt 60 -and -not $link; $i++) {
+            Start-Sleep 2
+            $txt = (Get-Content up_out.txt, up_err.txt -ErrorAction SilentlyContinue) -join "`n"
+            if ($txt -match "https://login\.tailscale\.com/\S+") { $link = $Matches[0] }
+          }
+          if (-not $link) { Write-Host "Ja logado ou link nao apareceu. Seguindo..." }
+          else {
+            Write-Host "=================================================="
+            Write-Host " LOGUE NO TAILSCALE POR ESTE LINK:"
+            Write-Host " $link"
+            Write-Host "=================================================="
+          }
+          # Espera o login ser concluido (ate 10 min)
+          for ($i = 0; $i -lt 300; $i++) {
+            $st = & $ts status --json 2>$null | ConvertFrom-Json
+            if ($st.BackendState -eq "Running") { break }
+            Start-Sleep 2
+          }
+          $ip = (& $ts ip -4).Trim()
+          "IP=$ip" | Out-File -FilePath ip.txt -Encoding ascii
+
+      # ---------- ETAPA 4: Dados do PC + manter ligado ----------
+      - name: "4/4 Dados do PC e manter ligado"
+        shell: pwsh
+        run: |
+          $ip = (Get-Content ip.txt) -replace "IP=", ""
+          $senha = (Get-Content senha.txt) -replace "SENHA=", ""
+          # Baixa o instalador do Roblox na area de trabalho
+          try {
+            Invoke-WebRequest "https://www.roblox.com/download/client" -OutFile "$env:USERPROFILE\Desktop\RobloxPlayerInstaller.exe"
+          } catch { Write-Host "Nao baixei o Roblox: $_" }
+          Write-Host "=================================================="
+          Write-Host " PC PRONTO (GPU emulada por software - WARP)"
+          Write-Host " IP:      $ip"
+          Write-Host " Usuario: runneradmin"
+          Write-Host " Senha:   $senha"
+          Write-Host " Abra o app 'Windows App' e conecte neste IP."
+          Write-Host "=================================================="
+          $fim = (Get-Date).AddMinutes([int]$env:MINUTOS)
+          while ((Get-Date) -lt $fim) {
+            $resta = [int]($fim - (Get-Date)).TotalMinutes
+            Write-Host "PC ligado... faltam ~$resta min"
+            Start-Sleep 60
+          }
+          Write-Host "Tempo acabou. Desligando."
